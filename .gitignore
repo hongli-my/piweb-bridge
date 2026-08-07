@@ -1,0 +1,12 @@
+# 依赖
+node_modules/
+
+# 运行时日志
+*.log
+
+# 测试产物
+/tmp/
+*-screenshot.png
+
+# 系统
+.DS_Store

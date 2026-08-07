@@ -1,0 +1,12 @@
+{
+  "name": "piweb-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run pi-bridge.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "playwright": "^1.62.1"
+  }
+}
