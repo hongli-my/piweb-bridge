@@ -15,11 +15,15 @@
  *   环境变量：PIWEB_PORT(默认8643) PIWEB_CWD(默认process.cwd()) PIWEB_AGENT_DIR(默认~/.pi/agent)
  */
 
-import { unlink } from "node:fs/promises";
+import { unlink, readdir, readFile, writeFile, mkdir, rm, rename, stat } from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
 import {
   createAgentSession,
   SessionManager,
   ModelRuntime,
+  parseFrontmatter,
+  loadSkills,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
 
@@ -27,6 +31,8 @@ import {
 const PORT = Number(process.env.PIWEB_PORT || 8643);
 const CWD = process.env.PIWEB_CWD || process.cwd();
 const AGENT_DIR = process.env.PIWEB_AGENT_DIR || undefined;
+// 解析后的 agent 目录（扫描 agents/extensions/skills/settings 用）
+const RESOLVED_AGENT_DIR = AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
 
 const modelRuntime = await ModelRuntime.create(AGENT_DIR ? { agentDir: AGENT_DIR } : undefined);
 const availableModels = await modelRuntime.getAvailable();
@@ -45,6 +51,155 @@ if (!defaultModel) {
   process.exit(1);
 }
 console.log(`[pi-bridge] 默认模型: ${defaultModel.name} (${defaultModel.provider}/${defaultModel.id})`);
+
+// ---------------- Subagent / Extension / Skill 管理辅助 ----------------
+async function pathExists(p: string): Promise<boolean> {
+  try { await stat(p); return true; } catch { return false; }
+}
+
+async function readSettings(): Promise<any> {
+  try { return JSON.parse(await readFile(path.join(RESOLVED_AGENT_DIR, "settings.json"), "utf8")); }
+  catch { return {}; }
+}
+async function writeSettings(s: any): Promise<void> {
+  await writeFile(path.join(RESOLVED_AGENT_DIR, "settings.json"), JSON.stringify(s, null, 2) + "\n", "utf8");
+}
+
+/** 扫描 agents 目录，解析每个 subagent 的 frontmatter + body */
+async function listAgents(): Promise<any[]> {
+  const dir = path.join(RESOLVED_AGENT_DIR, "agents");
+  const out: any[] = [];
+  let entries: any[] = [];
+  try { entries = await readdir(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const name = e.name;
+    const subDir = path.join(dir, name);
+    // 找 .md：优先 <name>.md，否则目录下第一个 .md
+    let file = path.join(subDir, name + ".md");
+    if (!await pathExists(file)) {
+      let files: string[] = [];
+      try { files = await readdir(subDir); } catch { continue; }
+      const md = files.find(f => f.endsWith(".md"));
+      if (!md) continue;
+      file = path.join(subDir, md);
+    }
+    let content = "";
+    try { content = await readFile(file, "utf8"); } catch { continue; }
+    const { frontmatter, body } = parseFrontmatter<any>(content);
+    const toArray = (v: any): string[] => {
+      if (Array.isArray(v)) return v.map(String);
+      if (typeof v === "string") return v.split(",").map((s: string) => s.trim()).filter(Boolean);
+      return [];
+    };
+    out.push({
+      name: String(frontmatter.name || name),
+      description: String(frontmatter.description || ""),
+      model: frontmatter.model ? String(frontmatter.model) : "",
+      tools: toArray(frontmatter.tools),
+      systemPromptMode: String(frontmatter.systemPromptMode || "append"),
+      inheritProjectContext: frontmatter.inheritProjectContext !== false,
+      inheritSkills: frontmatter.inheritSkills !== false,
+      defaultContext: String(frontmatter.defaultContext || "fresh"),
+      skills: toArray(frontmatter.skills),
+      skillPath: frontmatter.skillPath ? String(frontmatter.skillPath) : "",
+      hasSkillsDir: await pathExists(path.join(subDir, "skills")),
+      dir: subDir,
+      file,
+      body: (body || "").trim(),
+    });
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+/** 把 frontmatter + body 序列化为 .md（YAML frontmatter）*/
+function serializeAgent(fm: Record<string, any>, body: string): string {
+  const order = ["name", "description", "model", "tools", "systemPromptMode", "inheritProjectContext", "inheritSkills", "defaultContext", "skillPath", "skills", "acceptance", "acceptanceRole", "agentContract"];
+  const lines = ["---"];
+  const seen = new Set<string>();
+  const fmt = (v: any): string => {
+    if (Array.isArray(v)) return v.join(", ");
+    if (typeof v === "boolean") return v ? "true" : "false";
+    return String(v);
+  };
+  for (const k of order) {
+    if (fm[k] === undefined || fm[k] === null || fm[k] === "") continue;
+    if (Array.isArray(fm[k]) && fm[k].length === 0) continue;
+    seen.add(k);
+    lines.push(`${k}: ${fmt(fm[k])}`);
+  }
+  for (const k of Object.keys(fm)) {
+    if (seen.has(k)) continue;
+    if (fm[k] === undefined || fm[k] === null || fm[k] === "") continue;
+    if (Array.isArray(fm[k]) && fm[k].length === 0) continue;
+    lines.push(`${k}: ${fmt(fm[k])}`);
+  }
+  lines.push("---", "", (body || "").trim());
+  return lines.join("\n") + "\n";
+}
+
+/** 列出扩展：本地目录 + settings.packages(npm) */
+async function listExtensions(): Promise<any[]> {
+  const out: any[] = [];
+  // 1. 本地目录扩展
+  const localDir = path.join(RESOLVED_AGENT_DIR, "extensions");
+  let entries: any[] = [];
+  try { entries = await readdir(localDir, { withFileTypes: true }); } catch {}
+  for (const e of entries) {
+    if (!e.isDirectory()) continue;
+    const name = e.name;
+    const fullPath = path.join(localDir, name);
+    const info: any = { name, type: "local", path: fullPath };
+    try {
+      const pkg = JSON.parse(await readFile(path.join(fullPath, "package.json"), "utf8"));
+      info.description = pkg.description || "";
+      info.version = pkg.version || "";
+      if (pkg.pi) info.pi = pkg.pi;
+    } catch {}
+    out.push(info);
+  }
+  // 2. settings.packages 配置的 npm 包
+  const settings = await readSettings();
+  const packages: any[] = settings.packages || [];
+  for (const pkg of packages) {
+    const src = typeof pkg === "string" ? pkg : (pkg && pkg.source);
+    if (typeof src !== "string") continue;
+    if (src.startsWith("npm:")) {
+      const pkgName = src.slice(4);
+      const realPath = path.join(RESOLVED_AGENT_DIR, "npm", "node_modules", pkgName);
+      const info: any = { name: pkgName, type: "package", source: src, path: realPath, configured: true };
+      try {
+        const p = JSON.parse(await readFile(path.join(realPath, "package.json"), "utf8"));
+        info.description = p.description || "";
+        info.version = p.version || "";
+      } catch { info.installed = false; }
+      out.push(info);
+    } else if (src.startsWith("git+") || src.startsWith("file:") || src.startsWith("/")) {
+      out.push({ name: src, type: "path", source: src, path: src, configured: true });
+    } else {
+      out.push({ name: src, type: "package", source: src, path: "", configured: true });
+    }
+  }
+  return out;
+}
+
+/** 加载 skills（真实，替换空桩）*/
+async function listAllSkills(): Promise<any[]> {
+  try {
+    const res = loadSkills({ cwd: CWD, agentDir: RESOLVED_AGENT_DIR, skillPaths: [], includeDefaults: true });
+    return (res.skills || []).map((s: any) => ({
+      name: s.name,
+      description: s.description || "",
+      filePath: s.filePath || "",
+      baseDir: s.baseDir || "",
+      disableModelInvocation: !!s.disableModelInvocation,
+    }));
+  } catch (e: any) {
+    console.warn("[pi-bridge] loadSkills failed:", e.message);
+    return [];
+  }
+}
 
 // ---------------- 会话缓存 ----------------
 const sessionCache = new Map<string, AgentSession>(); // sessionId -> session
@@ -413,8 +568,98 @@ const server = Bun.serve({
         return json({ ok: true });
       }
 
-      // ---- Skills（pi 有，先返回空，后续接 ResourceLoader）----
-      if (p === "/skills/builtin" && m === "GET") return json({ ok: true, skills: [] });
+      // ---- Subagents 管理（读写 ~/.pi/agent/agents）----
+      if (p === "/agents" && m === "GET") return json({ ok: true, data: await listAgents() });
+
+      const agentMatch = p.match(/^\/agents\/([^/]+)$/);
+      if (agentMatch && m === "GET") {
+        const list = await listAgents();
+        const a = list.find(x => x.name === agentMatch[1] || path.basename(x.dir) === agentMatch[1]);
+        if (!a) return json({ ok: false, error: "agent not found" }, 404);
+        return json({ ok: true, data: a });
+      }
+      if (agentMatch && m === "DELETE") {
+        const dir = path.join(RESOLVED_AGENT_DIR, "agents", agentMatch[1]);
+        if (!await pathExists(dir)) return json({ ok: false, error: "not found" }, 404);
+        await rm(dir, { recursive: true, force: true });
+        return json({ ok: true });
+      }
+      if (p === "/agents" && m === "POST") {
+        const b = await readBody(req);
+        const name = String(b.name || "").trim();
+        if (!/^[a-zA-Z0-9_-]+$/.test(name)) return json({ ok: false, error: "invalid name (a-z 0-9 _ -)" }, 400);
+        const agentDir = path.join(RESOLVED_AGENT_DIR, "agents", name);
+        if (await pathExists(agentDir)) return json({ ok: false, error: "agent already exists" }, 409);
+        await mkdir(agentDir, { recursive: true });
+        const file = path.join(agentDir, name + ".md");
+        const fm: Record<string, any> = {
+          name,
+          description: b.description || "",
+          model: b.model || "",
+          tools: b.tools || [],
+          systemPromptMode: b.systemPromptMode || "append",
+          inheritProjectContext: b.inheritProjectContext !== false,
+          inheritSkills: b.inheritSkills !== false,
+          defaultContext: b.defaultContext || "fresh",
+          skillPath: b.skillPath || "",
+          skills: b.skills || [],
+        };
+        await writeFile(file, serializeAgent(fm, b.body || ""), "utf8");
+        return json({ ok: true, data: { ...fm, dir: agentDir, file, body: (b.body || "").trim(), hasSkillsDir: false } });
+      }
+      if (agentMatch && m === "PATCH") {
+        const oldName = agentMatch[1];
+        const b = await readBody(req);
+        const list = await listAgents();
+        const a = list.find(x => x.name === oldName || path.basename(x.dir) === oldName);
+        if (!a) return json({ ok: false, error: "agent not found" }, 404);
+        const newName = String(b.name || a.name).trim();
+        let dir = a.dir, file = a.file, finalName = a.name;
+        if (newName !== a.name && newName) {
+          if (!/^[a-zA-Z0-9_-]+$/.test(newName)) return json({ ok: false, error: "invalid name" }, 400);
+          const newDir = path.join(RESOLVED_AGENT_DIR, "agents", newName);
+          if (await pathExists(newDir)) return json({ ok: false, error: "name already exists" }, 409);
+          await rename(a.dir, newDir);
+          const oldFile = path.join(newDir, path.basename(a.file));
+          const newFile = path.join(newDir, newName + ".md");
+          if (await pathExists(oldFile)) await rename(oldFile, newFile);
+          dir = newDir; file = newFile; finalName = newName;
+        }
+        const fm: Record<string, any> = {
+          name: finalName,
+          description: b.description !== undefined ? b.description : a.description,
+          model: b.model !== undefined ? b.model : a.model,
+          tools: b.tools !== undefined ? b.tools : a.tools,
+          systemPromptMode: b.systemPromptMode !== undefined ? b.systemPromptMode : a.systemPromptMode,
+          inheritProjectContext: b.inheritProjectContext !== undefined ? b.inheritProjectContext : a.inheritProjectContext,
+          inheritSkills: b.inheritSkills !== undefined ? b.inheritSkills : a.inheritSkills,
+          defaultContext: b.defaultContext !== undefined ? b.defaultContext : a.defaultContext,
+          skillPath: b.skillPath !== undefined ? b.skillPath : a.skillPath,
+          skills: b.skills !== undefined ? b.skills : a.skills,
+        };
+        const bodyText = b.body !== undefined ? b.body : a.body;
+        await writeFile(file, serializeAgent(fm, bodyText), "utf8");
+        return json({ ok: true, data: { ...fm, dir, file, body: (bodyText || "").trim(), hasSkillsDir: a.hasSkillsDir } });
+      }
+
+      // ---- Extensions 展示（本地目录 + packages）----
+      if (p === "/extensions" && m === "GET") return json({ ok: true, data: await listExtensions() });
+
+      // ---- Skills（真实加载，替换空桩）----
+      if ((p === "/skills" || p === "/skills/builtin") && m === "GET") {
+        const skills = await listAllSkills();
+        return json({ ok: true, skills, data: skills });
+      }
+
+      // ---- Settings 读/写 ----
+      if (p === "/settings" && m === "GET") return json({ ok: true, data: await readSettings() });
+      if (p === "/settings" && m === "PATCH") {
+        const b = await readBody(req);
+        const s = await readSettings();
+        Object.assign(s, b);
+        await writeSettings(s);
+        return json({ ok: true, data: s });
+      }
 
       // ---- 项目 = 目录（pi session 按 cwd 存储，项目 id 直接用 cwd）----
       if (p.startsWith("/projects")) {
