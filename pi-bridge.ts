@@ -545,11 +545,26 @@ const server = Bun.serve({
         });
       }
 
-      // ---- 模型 / Provider（前端 provider-selector 复用）----
+      // ---- 模型 / Provider（前端模型选择器复用）----
       if (p === "/providers" && m === "GET") {
+        // 按 provider 分组返回全部模型 + 当前选中（旧版只返回前12个且不含用户自配模型，已修）
+        const byProvider: Record<string, any[]> = {};
+        for (const mm of availableModels) {
+          const pv = String(mm.provider || "unknown");
+          if (!byProvider[pv]) byProvider[pv] = [];
+          byProvider[pv].push({
+            id: mm.id, name: mm.name,
+            reasoning: !!(mm as any).reasoning,
+            contextWindow: (mm as any).contextWindow || 0,
+            input: (mm as any).input || [],
+          });
+        }
+        const providers = Object.keys(byProvider).map((name) => ({ name, models: byProvider[name] }));
         return json({
           ok: true,
-          providers: availableModels.slice(0, 12).map((mm: any) => ({ name: mm.id, model: mm.name })),
+          providers,
+          current: defaultModel ? { provider: defaultModel.provider, modelId: defaultModel.id, name: defaultModel.name } : null,
+          // 兼容旧字段
           current_provider: defaultModel?.id || "",
         });
       }
@@ -558,14 +573,22 @@ const server = Bun.serve({
       }
       if (p === "/model" && m === "POST") {
         const body = await readBody(req);
-        const target = availableModels.find((mm: any) => mm.id === body.provider || mm.id === body.modelId);
+        // 优先 provider + modelId 精确定位；兼容旧 provider=模型id
+        let target: any;
+        if (body.provider && body.modelId) {
+          target = availableModels.find((mm: any) => mm.provider === body.provider && mm.id === body.modelId);
+        } else if (body.modelId) {
+          target = availableModels.find((mm: any) => mm.id === body.modelId);
+        } else if (body.provider) {
+          target = availableModels.find((mm: any) => mm.id === body.provider || mm.provider === body.provider);
+        }
         if (!target) return json({ ok: false, error: "model not found" }, 404);
         defaultModel = target;
         // 切换所有缓存 session 的模型
         for (const s of sessionCache.values()) {
           try { await s.setModel(target); } catch {}
         }
-        return json({ ok: true });
+        return json({ ok: true, data: { provider: target.provider, modelId: target.id, name: target.name } });
       }
 
       // ---- Subagents 管理（读写 ~/.pi/agent/agents）----
