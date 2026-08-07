@@ -26,4 +26,8 @@ DEFAULT_CWD="$(cd "$(dirname "$0")/.." && pwd)"
 exec env -u PI_SESSION_FILE -u PI_SESSION_ID -u PI_SUBAGENT_PARENT_SESSION -u PI_CODING_AGENT \
     PIWEB_PORT="${PIWEB_PORT:-8643}" \
     PIWEB_CWD="${PIWEB_CWD:-$DEFAULT_CWD}" \
+    PI_PROVIDER="${PI_PROVIDER:-my-provider}" \
+    PI_MODEL="${PI_MODEL:-glm5-cdp}" \
+    OPENAI_API_KEY="${OPENAI_API_KEY}" \
+    OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://11.160.215.64/v1}" \
     bun run pi-bridge.ts

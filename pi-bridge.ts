@@ -547,19 +547,19 @@ const server = Bun.serve({
 
       // ---- 模型 / Provider（前端模型选择器复用）----
       if (p === "/providers" && m === "GET") {
-        // 按 provider 分组返回全部模型 + 当前选中（旧版只返回前12个且不含用户自配模型，已修）
-        const byProvider: Record<string, any[]> = {};
-        for (const mm of availableModels) {
-          const pv = String(mm.provider || "unknown");
-          if (!byProvider[pv]) byProvider[pv] = [];
-          byProvider[pv].push({
-            id: mm.id, name: mm.name,
-            reasoning: !!(mm as any).reasoning,
-            contextWindow: (mm as any).contextWindow || 0,
-            input: (mm as any).input || [],
-          });
-        }
-        const providers = Object.keys(byProvider).map((name) => ({ name, models: byProvider[name] }));
+        // 只返回 my-provider 的模型（自定义模型）
+        const myProviderModels = availableModels.filter((mm: any) => mm.provider === "my-provider");
+        const providers = myProviderModels.length > 0 ? [
+          {
+            name: "my-provider",
+            models: myProviderModels.map((mm: any) => ({
+              id: mm.id, name: mm.name,
+              reasoning: !!(mm as any).reasoning,
+              contextWindow: (mm as any).contextWindow || 0,
+              input: (mm as any).input || [],
+            }))
+          }
+        ] : [];
         return json({
           ok: true,
           providers,
