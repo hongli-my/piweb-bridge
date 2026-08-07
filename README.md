@@ -62,13 +62,31 @@ export OPENAI_BASE_URL=http://your-proxy/v1
 
 ### 2. 启动 pi-bridge
 
+**前台启动**（调试用）：
 ```bash
 cd ~/ai-home/piweb-bridge
 ./start.sh
-# 后台运行：nohup ./start.sh > /tmp/pi-bridge.log 2>&1 &
+# 或
+./start.sh foreground
 ```
 
-`start.sh` 会自动清除 `PI_SESSION_FILE` / `PI_SESSION_ID` 等环境变量——这些是 pi CLI 当前会话留下的，会让 SDK 误判为子代理导致 hang。
+**后台启动**（推荐）：
+```bash
+cd ~/ai-home/piweb-bridge
+./start.sh start
+```
+
+**其他管理命令**：
+```bash
+./start.sh stop      # 停止
+./start.sh restart   # 重启
+./start.sh status    # 查看状态
+./start.sh logs      # 查看日志（tail -f）
+```
+
+**日志位置**：`pi-bridge.log`（自动创建在 piweb-bridge 目录）
+
+**PID 文件**：`pi-bridge.pid`（用于进程管理）
 
 ### 3. OpenResty（已配置，只需 reload）
 
