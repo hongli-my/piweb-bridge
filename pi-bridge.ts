@@ -202,8 +202,36 @@ async function listAllSkills(): Promise<any[]> {
 }
 
 // ---------------- 会话缓存 ----------------
-const sessionCache = new Map<string, AgentSession>(); // sessionId -> session
+// LRU 缓存：长时间运行时避免打开过的 session 全部常驻导致 OOM 崩溃。
+// 仅淘汰非流式中的 session；容量可通过 PIWEB_SESSION_CACHE_SIZE 配置（默认 16）。
+const SESSION_CACHE_MAX = Number(process.env.PIWEB_SESSION_CACHE_SIZE || 16);
+const sessionCache = new Map<string, AgentSession>(); // sessionId -> session（Map 按插入序，touch 时删除再 set 置尾）
 const idToPath = new Map<string, string>();           // sessionId -> session 文件路径
+
+/** 命中时调用，把 session 移到 LRU 尾部（最近使用） */
+function touchSessionCache(sid: string) {
+  const s = sessionCache.get(sid);
+  if (s) { sessionCache.delete(sid); sessionCache.set(sid, s); }
+}
+
+/** 超容量时淘汰最久未用的非流式 session，释放内存 */
+function evictSessionCache() {
+  let guard = 0;
+  while (sessionCache.size > SESSION_CACHE_MAX && guard++ < SESSION_CACHE_MAX + 4) {
+    const oldest = sessionCache.keys().next().value;
+    if (oldest === undefined) break;
+    const s = sessionCache.get(oldest);
+    // 正在流式的 session 不能淘汰：置尾跳过，避免误杀活跃流
+    if (s && (s as any).isStreaming) {
+      sessionCache.delete(oldest);
+      sessionCache.set(oldest, s);
+      continue;
+    }
+    sessionCache.delete(oldest);
+    try { s?.dispose(); } catch {}
+    console.log("[pi-bridge] LRU evict session:", oldest);
+  }
+}
 
 async function refreshIdToPath() {
   const all = await SessionManager.listAll();
@@ -213,7 +241,7 @@ async function refreshIdToPath() {
 /** 按 sessionId 拿到（或从文件恢复）一个 AgentSession */
 async function ensureSession(sid: string): Promise<AgentSession> {
   const cached = sessionCache.get(sid);
-  if (cached) return cached;
+  if (cached) { touchSessionCache(sid); return cached; }
   if (!idToPath.has(sid)) await refreshIdToPath();
   const path = idToPath.get(sid);
   if (!path) throw new Error("session not found: " + sid);
@@ -226,6 +254,7 @@ async function ensureSession(sid: string): Promise<AgentSession> {
     ...(AGENT_DIR ? { agentDir: AGENT_DIR } : {}),
   });
   sessionCache.set(sid, session);
+  evictSessionCache();
   return session;
 }
 
@@ -285,8 +314,27 @@ function toHermesMessage(msg: any): any {
   return msg;
 }
 
-/** 把事件里的 message/messages/toolResults 字段转成 Hermes 格式，type 保持 pi 原生 */
+/** 把事件里的 message/messages/toolResults 字段转成 Hermes 格式，type 保持 pi 原生；
+ *  同时裁剪前端不消费的重量级字段，避免 SSE 体积爆炸（多轮+大工具输出时 agent_end.messages 可达数 MB） */
 function transformEvent(event: any): any {
+  const t = event?.type;
+  // agent_end：前端无处理分支，messages 数组（含全部历史+工具输出）可达数 MB，剥离
+  if (t === "agent_end") {
+    const { messages, ...rest } = event;
+    return rest;
+  }
+  // turn_end：前端无处理分支，message(完整 content blocks)/toolResults 剥离
+  if (t === "turn_end") {
+    const { message, toolResults, ...rest } = event;
+    return rest;
+  }
+  // message_update：前端只用 assistantMessageEvent.delta/type/toolCall，
+  // partial 是累积全量（每个 delta 都带从头累积的完整内容，冗余且随回复变长膨胀），剥离
+  if (t === "message_update" && event.assistantMessageEvent) {
+    const { partial, ...aeRest } = event.assistantMessageEvent;
+    return { ...event, assistantMessageEvent: aeRest };
+  }
+  // 其余事件：转换 message/messages/toolResults 字段为 Hermes 格式
   let out = event;
   if (event.message) out = { ...event, message: toHermesMessage(event.message) };
   if (event.messages) out = { ...event, messages: event.messages.map(toHermesMessage) };
@@ -313,41 +361,102 @@ async function readBody(req: Request): Promise<any> {
   try { return await req.json(); } catch { return {}; }
 }
 
+// 进程内同步忙锁：防止同一 session 并发 prompt 搅乱状态（isStreaming 检查有异步窗口，不可靠）
+const busySessions = new Set<string>();
+
+// 活跃 SSE 流的 finish 回调集合：进程收到 SIGTERM/SIGINT 优雅退出时，
+// 先把所有在途流正常 finish（发送 chunked 终止符），避免 nginx 报
+// "upstream prematurely closed connection" / 浏览器报 ERR_INCOMPLETE_CHUNKED_ENCODING。
+const activeStreamFinishers = new Set<() => void>();
+
+// SSE 心跳间隔（保持连接活性，防 nginx/浏览器 idle 断开）与最大流寿命（agent 卡死时兑底强制结束）
+const HEARTBEAT_MS = Number(process.env.PIWEB_HEARTBEAT_MS || 15000);
+const MAX_STREAM_MS = Number(process.env.PIWEB_MAX_STREAM_MS || 30 * 60 * 1000);
+
+// 时间戳辅助（诊断日志用，HH:MM:SS.mmm）
+function ts(): string {
+  return new Date().toISOString().slice(11, 23);
+}
+
 /** 构造 SSE 流：订阅 session 事件 → 序列化推送；prompt 驱动 */
-function sseResponse(session: AgentSession, message: string): Response {
+function sseResponse(session: AgentSession, message: string, lockSid?: string): Response {
   const enc = new TextEncoder();
   let unsub: (() => void) | undefined;
   let finished = false;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  let hbCount = 0;
+  const startedAt = Date.now();
+  let finishReason = "unknown";
+
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const doSend = (obj: any) => {
         if (finished) return;
         try { controller.enqueue(enc.encode(`data: ${JSON.stringify(obj)}\n\n`)); } catch {}
       };
-      const finish = () => {
+      const finish = (reason?: string) => {
         if (finished) return;
         finished = true;
+        if (reason) finishReason = reason;
         try { if (unsub) unsub(); } catch {}
+        try { if (heartbeat) clearInterval(heartbeat); } catch {}
+        try { if (watchdog) clearTimeout(watchdog); } catch {}
+        try { if (lockSid) busySessions.delete(lockSid); } catch {}
         try { controller.close(); } catch {}
+        try { activeStreamFinishers.delete(finisher); } catch {}
+        console.log(`[pi-bridge] [${ts()}] SSE finish sid=${lockSid || "-"} reason=${finishReason} hb=${hbCount} elapsed=${Date.now() - startedAt}ms`);
       };
+      // 注册到全局集合，供优雅退出时调用
+      const finisher = () => finish("shutdown");
+      activeStreamFinishers.add(finisher);
+
+      // 心跳：SSE 注释行（: ping），前端解析器忽略，但字节流保持流动，防止中间链路 idle 断开
+      heartbeat = setInterval(() => {
+        if (finished) return;
+        try { controller.enqueue(enc.encode(`: ping\n\n`)); hbCount++; } catch {}
+      }, HEARTBEAT_MS);
+
+      // 兑底最大寿命：agent 真正卡死（进程活着但不发事件）时强制结束，避免前端永远转圈
+      watchdog = setTimeout(() => {
+        console.warn(`[pi-bridge] [${ts()}] stream max lifetime reached, force finish sid=${lockSid || "-"}`);
+        doSend({ type: "error", error: "agent timed out (max stream lifetime)" });
+        finish("max_lifetime");
+      }, MAX_STREAM_MS);
+
+      // 订阅事件：每个事件独立 try/catch，避免单个坏事件导致 agent_settled 漏处理 → 流永不关闭
       unsub = session.subscribe((event: any) => {
-        doSend(transformEvent(event));
-        if (event.type === "agent_settled") finish();
+        try {
+          doSend(transformEvent(event));
+        } catch (e: any) {
+          console.warn(`[pi-bridge] [${ts()}] transform/send event failed:`, e?.message, "type=", event?.type);
+        }
+        try {
+          if (event?.type === "agent_settled") finish("settled");
+        } catch {}
       });
+
       try {
-        console.log("[pi-bridge] prompt start:", message.slice(0, 40), "| isStreaming:", (session as any).isStreaming);
+        console.log(`[pi-bridge] [${ts()}] prompt start sid=${lockSid || "-"}: ${message.slice(0, 40)} | isStreaming: ${(session as any).isStreaming}`);
         await session.prompt(message);
-        console.log("[pi-bridge] prompt done");
+        console.log(`[pi-bridge] [${ts()}] prompt done sid=${lockSid || "-"}`);
       } catch (e: any) {
-        console.log("[pi-bridge] prompt error:", e.message);
+        console.log(`[pi-bridge] [${ts()}] prompt error sid=${lockSid || "-"}:`, e.message);
         doSend({ type: "error", error: e.message || String(e) });
       } finally {
-        setTimeout(finish, 500);
+        // 给 agent_settled 一点时间到达；若无则强制收尾
+        setTimeout(() => finish("prompt_done"), 500);
       }
     },
     cancel() {
       finished = true;
+      finishReason = "client_cancel";
+      console.log(`[pi-bridge] [${ts()}] SSE cancel (client disconnected) sid=${lockSid || "-"} hb=${hbCount} elapsed=${Date.now() - startedAt}ms`);
       try { if (unsub) unsub(); } catch {}
+      try { if (heartbeat) clearInterval(heartbeat); } catch {}
+      try { if (watchdog) clearTimeout(watchdog); } catch {}
+      try { if (lockSid) busySessions.delete(lockSid); } catch {}
+      try { activeStreamFinishers.delete(finisher); } catch {}
       try { session.abort(); } catch {}
     },
   });
@@ -413,6 +522,7 @@ const server = Bun.serve({
         });
         const sid = session.sessionId;
         sessionCache.set(sid, session);
+        evictSessionCache();
         if (session.sessionFile) idToPath.set(sid, session.sessionFile);
         return json({ ok: true, session: { id: sid }, session_id: sid });
       }
@@ -485,9 +595,16 @@ const server = Bun.serve({
         const body = await readBody(req);
         const sid = body.session_id;
         if (!sid) return json({ ok: false, error: "session_id required" }, 400);
-        const session = await ensureSession(sid);
-        if ((session as any).isStreaming) return json({ ok: false, error: "session is busy" }, 409);
-        return sseResponse(session, body.message || "");
+        // 同步忙锁：在任何 await 之前抢占，消除并发竞态窗口（isStreaming 检查有异步窗口不可靠）
+        if (busySessions.has(sid)) return json({ ok: false, error: "session is busy" }, 409);
+        busySessions.add(sid);
+        try {
+          const session = await ensureSession(sid);
+          return sseResponse(session, body.message || "", sid);
+        } catch (e) {
+          busySessions.delete(sid);
+          throw e;
+        }
       }
 
       // ---- 插话（边跑边改需求）----
@@ -509,8 +626,12 @@ const server = Bun.serve({
       // ---- 中止 ----
       if (p === "/abort" && m === "POST") {
         const body = await readBody(req);
-        const session = await ensureSession(body.session_id);
-        await session.abort();
+        const sid = body.session_id;
+        if (sid) busySessions.delete(sid);   // 立即释放忙锁，前端可马上重发
+        try {
+          const session = await ensureSession(sid);
+          await session.abort();
+        } catch {}
         return json({ ok: true });
       }
 
@@ -738,3 +859,23 @@ const server = Bun.serve({
 });
 
 console.log(`[pi-bridge] listening on http://127.0.0.1:${server.port}  cwd=${CWD}`);
+
+// ---------------- 优雅退出 ----------------
+// 收到 SIGTERM/SIGINT 时，先把所有在途 SSE 流正常 finish（发送 chunked 终止符），
+// 再退出进程。避免 stop/restart 时进行中的流被强制截断，导致前端 ERR_INCOMPLETE_CHUNKED_ENCODING。
+let shuttingDown = false;
+function gracefulShutdown(sig: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[pi-bridge] [${ts()}] ${sig} received, finishing ${activeStreamFinishers.size} active stream(s)...`);
+  for (const f of activeStreamFinishers) {
+    try { f(); } catch {}
+  }
+  // 给 socket 一点时间把终止符/缓冲发出去再退
+  setTimeout(() => {
+    try { server.stop(true); } catch {}
+    process.exit(0);
+  }, 400);
+}
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
