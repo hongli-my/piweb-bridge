@@ -64,10 +64,13 @@ start_foreground() {
         PI_MODEL="${PI_MODEL:-glm5-cdp}" \
         OPENAI_API_KEY="${OPENAI_API_KEY}" \
         OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://11.160.215.64/v1}" \
+        PIWEB_HEARTBEAT_MS="${PIWEB_HEARTBEAT_MS:-}" \
+        PIWEB_MAX_STREAM_MS="${PIWEB_MAX_STREAM_MS:-}" \
+        PIWEB_SESSION_CACHE_SIZE="${PIWEB_SESSION_CACHE_SIZE:-}" \
         bun run pi-bridge.ts
 }
 
-# 后台启动
+# 后台启动（带崩溃自重启守护循环）
 start_background() {
     if check_running; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] pi-bridge 已经在运行 (PID: $(cat "$PID_FILE"))"
@@ -75,25 +78,61 @@ start_background() {
     fi
 
     cd "$SCRIPT_DIR"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 后台启动 pi-bridge..."
-    echo "PID 文件: $PID_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 后台启动 pi-bridge（带守护，崩溃自动重启）..."
+    echo "PID 文件: $PID_FILE (守护进程)"
     echo "日志文件: $LOG_FILE"
     echo ""
 
-    # 清除 pi 会话环境变量并在后台启动
-    nohup env -u PI_SESSION_FILE -u PI_SESSION_ID -u PI_SUBAGENT_PARENT_SESSION -u PI_CODING_AGENT \
-        PIWEB_PORT="${PIWEB_PORT:-8643}" \
-        PIWEB_CWD="${PIWEB_CWD:-$DEFAULT_CWD}" \
-        PI_PROVIDER="${PI_PROVIDER:-my-provider}" \
-        PI_MODEL="${PI_MODEL:-glm5-cdp}" \
-        OPENAI_API_KEY="${OPENAI_API_KEY}" \
-        OPENAI_BASE_URL="${OPENAI_BASE_URL:-http://11.160.215.64/v1}" \
-        bun run pi-bridge.ts > "$LOG_FILE" 2>&1 &
+    PORT="${PIWEB_PORT:-8643}"
+    CWD_VAL="${PIWEB_CWD:-$DEFAULT_CWD}"
+    PROVIDER_VAL="${PI_PROVIDER:-my-provider}"
+    MODEL_VAL="${PI_MODEL:-glm5-cdp}"
+    KEY_VAL="${OPENAI_API_KEY}"
+    BASE_VAL="${OPENAI_BASE_URL:-http://11.160.215.64/v1}"
 
-    # 保存 PID
+    # 守护循环：bun 退出后自动重启，指数退避防崩溃风暴（运行>30s 视为正常，重置退避）
+    # macOS 兼容：不用 setsid，靠 trap 转发 TERM 给 bun 子进程
+    nohup bash -c '
+        STOP=0
+        BUN_PID=""
+        cleanup() {
+            STOP=1
+            [ -n "$BUN_PID" ] && kill -TERM "$BUN_PID" 2>/dev/null || true
+        }
+        trap cleanup TERM INT
+        BACKOFF=3
+        while [ "$STOP" -eq 0 ]; do
+            START=$(date +%s)
+            env -u PI_SESSION_FILE -u PI_SESSION_ID -u PI_SUBAGENT_PARENT_SESSION -u PI_CODING_AGENT \
+                PIWEB_PORT="'"$PORT"'" \
+                PIWEB_CWD="'"$CWD_VAL"'" \
+                PI_PROVIDER="'"$PROVIDER_VAL"'" \
+                PI_MODEL="'"$MODEL_VAL"'" \
+                OPENAI_API_KEY="'"$KEY_VAL"'" \
+                OPENAI_BASE_URL="'"$BASE_VAL"'" \
+                PIWEB_HEARTBEAT_MS="'"${PIWEB_HEARTBEAT_MS:-}"'" \
+                PIWEB_MAX_STREAM_MS="'"${PIWEB_MAX_STREAM_MS:-}"'" \
+                PIWEB_SESSION_CACHE_SIZE="'"${PIWEB_SESSION_CACHE_SIZE:-}"'" \
+                bun run pi-bridge.ts &
+            BUN_PID=$!
+            wait "$BUN_PID" 2>/dev/null
+            CODE=$?
+            [ "$STOP" -eq 1 ] && break
+            NOW=$(date +%s)
+            UPTIME=$((NOW - START))
+            if [ "$UPTIME" -gt 30 ]; then
+                BACKOFF=3
+            else
+                BACKOFF=$((BACKOFF * 2))
+                [ "$BACKOFF" -gt 60 ] && BACKOFF=60
+            fi
+            echo "[$(date "+%Y-%m-%d %H:%M:%S")] pi-bridge exited code=$CODE uptime=${UPTIME}s, restart in ${BACKOFF}s"
+            sleep "$BACKOFF"
+        done
+    ' < /dev/null >> "$LOG_FILE" 2>&1 &
+
     echo $! > "$PID_FILE"
 
-    # 等待一下确认启动成功
     sleep 2
     if check_running; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] pi-bridge 启动成功 (PID: $(cat "$PID_FILE"))"
@@ -109,7 +148,8 @@ stop() {
     if check_running; then
         PID=$(cat "$PID_FILE")
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 停止 pi-bridge (PID: $PID)..."
-        kill "$PID" 2>/dev/null || true
+        # 信号守护进程 → trap 转发 TERM 给 bun 子进程并退出循环
+        kill -TERM "$PID" 2>/dev/null || true
 
         # 等待进程停止
         for i in {1..10}; do
@@ -124,6 +164,8 @@ stop() {
         # 强制停止
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 强制停止 pi-bridge..."
         kill -9 "$PID" 2>/dev/null || true
+        # 兑底：清理可能残留的孤儿 bun 子进程
+        pkill -9 -f "bun run pi-bridge.ts" 2>/dev/null || true
         rm -f "$PID_FILE"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] pi-bridge 已强制停止"
     else
