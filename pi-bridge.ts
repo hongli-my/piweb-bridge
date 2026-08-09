@@ -36,6 +36,14 @@ const RESOLVED_AGENT_DIR = AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
 
 const modelRuntime = await ModelRuntime.create(AGENT_DIR ? { agentDir: AGENT_DIR } : undefined);
 const availableModels = await modelRuntime.getAvailable();
+// 用户在 models.json 里自定义配置的 provider 白名单（过滤掉 SDK 内置 provider 如 openai/anthropic）
+let customProviderNames: Set<string> = new Set();
+try {
+  const modelsJson = JSON.parse(await readFile(path.join(RESOLVED_AGENT_DIR, "models.json"), "utf8"));
+  customProviderNames = new Set(Object.keys(modelsJson.providers || {}));
+} catch {}
+// 仅保留自定义 provider 的模型（前端选择器展示 + 切换均基于此）
+const visibleModels = availableModels.filter((mm: any) => customProviderNames.has(mm.provider));
 // 默认模型：优先环境变量 PI_PROVIDER/PI_MODEL（与 pi CLI 启动一致），其次 anthropic/openai
 const _envProvider = process.env.PI_PROVIDER;
 const _envModel = process.env.PI_MODEL;
@@ -672,19 +680,22 @@ const server = Bun.serve({
 
       // ---- 模型 / Provider（前端模型选择器复用）----
       if (p === "/providers" && m === "GET") {
-        // 只返回 my-provider 的模型（自定义模型）
-        const myProviderModels = availableModels.filter((mm: any) => mm.provider === "my-provider");
-        const providers = myProviderModels.length > 0 ? [
-          {
-            name: "my-provider",
-            models: myProviderModels.map((mm: any) => ({
-              id: mm.id, name: mm.name,
-              reasoning: !!(mm as any).reasoning,
-              contextWindow: (mm as any).contextWindow || 0,
-              input: (mm as any).input || [],
-            }))
-          }
-        ] : [];
+        // 按 provider 动态分组，只返回用户在 models.json 里配置的自定义 provider
+        const providersMap = new Map<string, any[]>();
+        for (const mm of visibleModels) {
+          const pv = (mm as any).provider;
+          if (!providersMap.has(pv)) providersMap.set(pv, []);
+          providersMap.get(pv)!.push(mm);
+        }
+        const providers = Array.from(providersMap.entries()).map(([name, models]) => ({
+          name,
+          models: models.map((mm: any) => ({
+            id: mm.id, name: mm.name,
+            reasoning: !!mm.reasoning,
+            contextWindow: mm.contextWindow || 0,
+            input: mm.input || [],
+          }))
+        }));
         return json({
           ok: true,
           providers,
@@ -694,18 +705,18 @@ const server = Bun.serve({
         });
       }
       if (p === "/models" && m === "GET") {
-        return json({ ok: true, models: availableModels.map((mm: any) => ({ id: mm.id, name: mm.name, provider: mm.provider })) });
+        return json({ ok: true, models: visibleModels.map((mm: any) => ({ id: mm.id, name: mm.name, provider: mm.provider })) });
       }
       if (p === "/model" && m === "POST") {
         const body = await readBody(req);
         // 优先 provider + modelId 精确定位；兼容旧 provider=模型id
         let target: any;
         if (body.provider && body.modelId) {
-          target = availableModels.find((mm: any) => mm.provider === body.provider && mm.id === body.modelId);
+          target = visibleModels.find((mm: any) => mm.provider === body.provider && mm.id === body.modelId);
         } else if (body.modelId) {
-          target = availableModels.find((mm: any) => mm.id === body.modelId);
+          target = visibleModels.find((mm: any) => mm.id === body.modelId);
         } else if (body.provider) {
-          target = availableModels.find((mm: any) => mm.id === body.provider || mm.provider === body.provider);
+          target = visibleModels.find((mm: any) => mm.id === body.provider || mm.provider === body.provider);
         }
         if (!target) return json({ ok: false, error: "model not found" }, 404);
         defaultModel = target;
