@@ -370,7 +370,7 @@ const busySessions = new Set<string>();
 const activeStreamFinishers = new Set<() => void>();
 
 // SSE 心跳间隔（保持连接活性，防 nginx/浏览器 idle 断开）与最大流寿命（agent 卡死时兑底强制结束）
-const HEARTBEAT_MS = Number(process.env.PIWEB_HEARTBEAT_MS || 15000);
+const HEARTBEAT_MS = Number(process.env.PIWEB_HEARTBEAT_MS || 5000);
 const MAX_STREAM_MS = Number(process.env.PIWEB_MAX_STREAM_MS || 30 * 60 * 1000);
 
 // 时间戳辅助（诊断日志用，HH:MM:SS.mmm）
@@ -412,6 +412,10 @@ function sseResponse(session: AgentSession, message: string, lockSid?: string): 
       activeStreamFinishers.add(finisher);
 
       // 心跳：SSE 注释行（: ping），前端解析器忽略，但字节流保持流动，防止中间链路 idle 断开
+      // 关键：Bun.serve 默认 idleTimeout=10s，而 setInterval 首次触发在间隔之后，
+      // 若间隔>10s 则首次心跳永远赶不上 → 连接被掐。故：① 流启动立即发一个 ping 覆盖开头空窗；
+      // ② 间隔降到 5s（< 10s idle 窗口），保证任何静默期内都有字节流过。
+      try { controller.enqueue(enc.encode(`: ping\n\n`)); hbCount++; } catch {}
       heartbeat = setInterval(() => {
         if (finished) return;
         try { controller.enqueue(enc.encode(`: ping\n\n`)); hbCount++; } catch {}
