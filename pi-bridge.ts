@@ -18,6 +18,7 @@
 import { unlink, readdir, readFile, writeFile, mkdir, rm, rename, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
+import { Cron } from "croner";
 import {
   createAgentSession,
   SessionManager,
@@ -207,6 +208,190 @@ async function listAllSkills(): Promise<any[]> {
     console.warn("[pi-bridge] loadSkills failed:", e.message);
     return [];
   }
+}
+
+// ---------------- 定时任务调度器 ----------------
+interface ScheduleTask {
+  id: string;
+  name: string;
+  prompt: string;
+  cron: string;            // 5-field cron expression
+  timezone: string;        // e.g. "Asia/Shanghai"
+  model?: string;          // model id or name; empty = default
+  cwd?: string;            // working directory; empty = CWD
+  enabled: boolean;
+  createdAt: number;
+  lastRunAt?: number;
+  nextRunAt?: number;
+}
+
+interface ScheduleRun {
+  id: string;
+  taskId: string;
+  status: "running" | "success" | "failed" | "skipped" | "timeout";
+  startedAt: number;
+  finishedAt?: number;
+  durationMs?: number;
+  sessionId?: string;      // pi session id — click to view full conversation
+  error?: string;
+  snippet?: string;        // first 200 chars of final assistant reply
+}
+
+const SCHEDULES_FILE = path.join(RESOLVED_AGENT_DIR, "schedules.json");
+const SCHEDULE_RUNS_FILE = path.join(RESOLVED_AGENT_DIR, "schedule_runs.json");
+const SCHEDULE_TIMEOUT_MS = Number(process.env.PIWEB_SCHEDULE_TIMEOUT_MS || 5 * 60 * 1000);
+const MAX_RUNS_PER_TASK = 50;
+
+const cronJobs = new Map<string, Cron>();           // taskId -> live Cron job
+const runningTasks = new Set<string>();              // single-flight guard
+let scheduleTasksCache: ScheduleTask[] = [];
+
+async function loadScheduleTasks(): Promise<ScheduleTask[]> {
+  try { return JSON.parse(await readFile(SCHEDULES_FILE, "utf8")); } catch { return []; }
+}
+async function saveScheduleTasks(tasks: ScheduleTask[]): Promise<void> {
+  await writeFile(SCHEDULES_FILE, JSON.stringify(tasks, null, 2), "utf8");
+}
+async function loadScheduleRuns(): Promise<ScheduleRun[]> {
+  try { return JSON.parse(await readFile(SCHEDULE_RUNS_FILE, "utf8")); } catch { return []; }
+}
+async function saveScheduleRuns(runs: ScheduleRun[]): Promise<void> {
+  await writeFile(SCHEDULE_RUNS_FILE, JSON.stringify(runs, null, 2), "utf8");
+}
+async function reloadScheduleTasksCache(): Promise<ScheduleTask[]> {
+  scheduleTasksCache = await loadScheduleTasks();
+  return scheduleTasksCache;
+}
+
+async function appendScheduleRun(run: ScheduleRun): Promise<void> {
+  let runs = await loadScheduleRuns();
+  runs.unshift(run);
+  // Cap per task
+  const byTask: Record<string, number> = {};
+  const capped: ScheduleRun[] = [];
+  for (const r of runs) {
+    const n = (byTask[r.taskId] = (byTask[r.taskId] || 0) + 1);
+    if (n <= MAX_RUNS_PER_TASK) capped.push(r);
+  }
+  await saveScheduleRuns(capped);
+}
+
+/** Register (or replace) a croner job for a task */
+function registerScheduleTask(task: ScheduleTask): void {
+  const existing = cronJobs.get(task.id);
+  if (existing) { try { existing.stop(); } catch {} }
+  if (!task.enabled) return;
+  try {
+    const job = new Cron(task.cron, { timezone: task.timezone, protect: true }, () => {
+      runScheduledTask(task.id).catch(e => console.error(`[pi-bridge] schedule task ${task.id} failed:`, e));
+    });
+    cronJobs.set(task.id, job);
+    task.nextRunAt = job.nextRun()?.getTime() || undefined;
+  } catch (e: any) {
+    console.error(`[pi-bridge] failed to register cron "${task.cron}" for task ${task.id}:`, e.message);
+  }
+}
+
+function unregisterScheduleTask(taskId: string): void {
+  const job = cronJobs.get(taskId);
+  if (job) { try { job.stop(); } catch {} cronJobs.delete(taskId); }
+}
+
+/** Execute a scheduled task: create one-shot AgentSession, run prompt, collect result */
+async function runScheduledTask(taskId: string): Promise<ScheduleRun> {
+  // Single-flight: skip if already running
+  if (runningTasks.has(taskId)) {
+    const skipRun: ScheduleRun = {
+      id: crypto.randomUUID(), taskId, status: "skipped",
+      startedAt: Date.now(), finishedAt: Date.now(), durationMs: 0,
+    };
+    await appendScheduleRun(skipRun);
+    console.log(`[pi-bridge] schedule task ${taskId} skipped (already running)`);
+    return skipRun;
+  }
+  runningTasks.add(taskId);
+
+  const tasks = await reloadScheduleTasksCache();
+  const task = tasks.find(t => t.id === taskId);
+  const runId = crypto.randomUUID();
+  const startedAt = Date.now();
+
+  if (!task) {
+    const run: ScheduleRun = { id: runId, taskId, status: "failed", startedAt, finishedAt: Date.now(), durationMs: 0, error: "task not found" };
+    await appendScheduleRun(run);
+    runningTasks.delete(taskId);
+    return run;
+  }
+
+  console.log(`[pi-bridge] [${ts()}] schedule task "${task.name}" starting...`);
+
+  // Resolve model
+  const model = task.model ? availableModels.find((mm: any) => mm.id === task.model || mm.name === task.model) : defaultModel;
+  const cwd = task.cwd || CWD;
+
+  let sid = "";
+  let status: ScheduleRun["status"] = "success";
+  let errorMessage: string | undefined;
+  let snippet: string | undefined;
+  let session: AgentSession | null = null;
+
+  try {
+    const sm = SessionManager.create(cwd);
+    const result = await createAgentSession({
+      sessionManager: sm,
+      modelRuntime,
+      cwd,
+      model: model || defaultModel,
+      ...(AGENT_DIR ? { agentDir: AGENT_DIR } : {}),
+    });
+    session = result.session;
+    sid = session.sessionId;
+    if (session.sessionFile) idToPath.set(sid, session.sessionFile);
+
+    // Timeout via abort
+    const timeout = setTimeout(() => {
+      try { session?.abort(); } catch {}
+    }, SCHEDULE_TIMEOUT_MS);
+
+    try {
+      await session.prompt(task.prompt);
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    // Collect final assistant message for snippet
+    const msgs = session.messages;
+    const lastAssistant = [...msgs].reverse().find((mm: any) => mm.role === "assistant");
+    if (lastAssistant) {
+      const text = Array.isArray(lastAssistant.content)
+        ? lastAssistant.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
+        : (lastAssistant.content || "");
+      snippet = text ? text.slice(0, 200) : undefined;
+    }
+  } catch (e: any) {
+    status = e?.message?.includes("abort") ? "timeout" : "failed";
+    errorMessage = e?.message || String(e);
+  } finally {
+    try { session?.dispose(); } catch {}
+  }
+
+  const finishedAt = Date.now();
+  const run: ScheduleRun = {
+    id: runId, taskId, status, startedAt, finishedAt,
+    durationMs: finishedAt - startedAt,
+    sessionId: sid || undefined, error: errorMessage, snippet,
+  };
+
+  // Update task lastRunAt + nextRunAt
+  task.lastRunAt = startedAt;
+  const job = cronJobs.get(taskId);
+  if (job) task.nextRunAt = job.nextRun()?.getTime() || undefined;
+  await saveScheduleTasks(tasks);
+
+  await appendScheduleRun(run);
+  runningTasks.delete(taskId);
+  console.log(`[pi-bridge] [${ts()}] schedule task "${task.name}" ${status} in ${run.durationMs}ms sid=${sid}`);
+  return run;
 }
 
 // ---------------- 会话缓存 ----------------
@@ -653,6 +838,27 @@ const server = Bun.serve({
         return json({ ok: true });
       }
 
+      // ---- 手动压缩上下文 ----
+      // 调用 session.compact()，SDK 会 emit compaction_start/compaction_end 事件。
+      // 手动压缩时 agent 通常空闲（无活跃 SSE），事件无人接收，故在此同步返回 result 供前端展示。
+      // 自动压缩（threshold/overflow）发生在 agent 回合中，有 SSE 连接，事件经 sseResponse 透传给前端。
+      if (p === "/compact" && m === "POST") {
+        const body = await readBody(req);
+        const sid = body.session_id;
+        if (!sid) return json({ ok: false, error: "missing session_id" }, 400);
+        if (busySessions.has(sid)) return json({ ok: false, error: "session is busy" }, 409);
+        busySessions.add(sid);
+        try {
+          const session = await ensureSession(sid);
+          const result = await session.compact();
+          return json({ ok: true, result: result || null });
+        } catch (e: any) {
+          return json({ ok: false, error: e?.message || String(e) }, 500);
+        } finally {
+          busySessions.delete(sid);
+        }
+      }
+
       // ---- 上下文用量 ----
       if (p === "/context" && m === "GET") {
         const sid = url.searchParams.get("session_id") || "";
@@ -859,6 +1065,71 @@ const server = Bun.serve({
         return json({ ok: true });
       }
 
+      // ---- 定时任务（Schedules）----
+      if (p === "/schedules" && m === "GET") {
+        const tasks = await reloadScheduleTasksCache();
+        for (const t of tasks) {
+          const job = cronJobs.get(t.id);
+          if (job && t.enabled) t.nextRunAt = job.nextRun()?.getTime() || undefined;
+        }
+        return json({ ok: true, data: tasks });
+      }
+      if (p === "/schedules" && m === "POST") {
+        const body = await readBody(req);
+        const task: ScheduleTask = {
+          id: crypto.randomUUID(),
+          name: body.name || "Untitled",
+          prompt: body.prompt || "",
+          cron: body.cron || "* * * * *",
+          timezone: body.timezone || "Asia/Shanghai",
+          model: body.model || undefined,
+          cwd: body.cwd || CWD,
+          enabled: body.enabled !== false,
+          createdAt: Date.now(),
+        };
+        const tasks = await reloadScheduleTasksCache();
+        tasks.push(task);
+        registerScheduleTask(task);
+        await saveScheduleTasks(tasks);
+        return json({ ok: true, data: task });
+      }
+      if (p.match(/^\/schedules\/[^/]+$/) && (m === "PUT" || m === "PATCH")) {
+        const tid = p.split("/")[2];
+        const tasks = await reloadScheduleTasksCache();
+        const task = tasks.find(t => t.id === tid);
+        if (!task) return json({ ok: false, error: "task not found" }, 404);
+        const body = await readBody(req);
+        if (body.name !== undefined) task.name = body.name;
+        if (body.prompt !== undefined) task.prompt = body.prompt;
+        if (body.cron !== undefined) task.cron = body.cron;
+        if (body.timezone !== undefined) task.timezone = body.timezone;
+        if (body.model !== undefined) task.model = body.model || undefined;
+        if (body.cwd !== undefined) task.cwd = body.cwd;
+        if (body.enabled !== undefined) task.enabled = body.enabled;
+        registerScheduleTask(task);
+        await saveScheduleTasks(tasks);
+        return json({ ok: true, data: task });
+      }
+      if (p.match(/^\/schedules\/[^/]+$/) && m === "DELETE") {
+        const tid = p.split("/")[2];
+        unregisterScheduleTask(tid);
+        const tasks = await reloadScheduleTasksCache();
+        const idx = tasks.findIndex(t => t.id === tid);
+        if (idx >= 0) tasks.splice(idx, 1);
+        await saveScheduleTasks(tasks);
+        return json({ ok: true });
+      }
+      if (p.match(/^\/schedules\/[^/]+\/run$/) && m === "POST") {
+        const tid = p.split("/")[2];
+        const run = await runScheduledTask(tid);
+        return json({ ok: true, data: run });
+      }
+      if (p.match(/^\/schedules\/[^/]+\/runs$/) && m === "GET") {
+        const tid = p.split("/")[2];
+        const runs = await loadScheduleRuns();
+        return json({ ok: true, data: runs.filter(r => r.taskId === tid) });
+      }
+
       // ---- 其它 Hermes 专属功能（memory/cron/kanban/workflow/search）桩化 ----
       if (p.startsWith("/memory") || p.startsWith("/cron") || p.startsWith("/kanban") ||
           p.startsWith("/workflow") || p.startsWith("/search") || p.startsWith("/skills")) {
@@ -874,6 +1145,21 @@ const server = Bun.serve({
 });
 
 console.log(`[pi-bridge] listening on http://127.0.0.1:${server.port}  cwd=${CWD}`);
+
+// ---------------- 定时任务调度器初始化 ----------------
+(async () => {
+  try {
+    const tasks = await reloadScheduleTasksCache();
+    let count = 0;
+    for (const t of tasks) {
+      if (t.enabled) { registerScheduleTask(t); count++; }
+    }
+    if (tasks.length > 0) await saveScheduleTasks(tasks); // persist nextRunAt
+    console.log(`[pi-bridge] schedules: ${count}/${tasks.length} tasks registered`);
+  } catch (e: any) {
+    console.error("[pi-bridge] failed to load schedules:", e.message);
+  }
+})();
 
 // ---------------- 优雅退出 ----------------
 // 收到 SIGTERM/SIGINT 时，先把所有在途 SSE 流正常 finish（发送 chunked 终止符），

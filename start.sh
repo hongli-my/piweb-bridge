@@ -26,8 +26,8 @@
 
 # 脚本目录和 PID/日志文件路径
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PID_FILE="$SCRIPT_DIR/pi-bridge.pid"
-LOG_FILE="$SCRIPT_DIR/pi-bridge.log"
+PID_FILE="$SCRIPT_DIR/log/pi-bridge.pid"
+LOG_FILE="$SCRIPT_DIR/log/pi-bridge.log"
 
 # 默认 cwd = 上级目录（~/ai-home）
 DEFAULT_CWD="$(cd "$SCRIPT_DIR/.." && pwd)"
