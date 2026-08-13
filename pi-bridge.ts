@@ -890,16 +890,43 @@ const server = Bun.serve({
       }
 
       // ---- 上下文用量 ----
+      // 算法：当前上下文窗口占用 = 最后一条 assistant 消息的 usage.input + usage.cacheRead
+      //   （每轮 LLM 调用回执的 input 已是该轮发给模型的完整上下文大小；
+      //    cacheRead>0 时 input 是非缓存增量，两者之和即窗口实际占用）
+      // 不再用历史所有轮次 input 累加（那是累计消耗，会虚高超过 contextWindow）。
+      // 附带 next_input 估算：下一次请求 input ≈ 当前占用 + 末轮 output（再加新用户消息）
+      //
+      // contextWindow 兜底：与 pi SDK compaction/branch-summarization.js 一致，
+      //   model.contextWindow 缺失或为 0 时用 128000。
+      //   这样 /context 的百分比与 SDK 内部 shouldCompact 触发阈值对齐：
+      //   压缩在 contextTokens > contextWindow - reserveTokens(默认16384) 时触发，
+      //   即 128K 窗口 ≈ 111.6K 时压缩；此端点 percent 也基于同一 max 计算。
       if (p === "/context" && m === "GET") {
         const sid = url.searchParams.get("session_id") || "";
+        const FALLBACK_CONTEXT_WINDOW = 128000;
         let model = "-", active = false, max = 0, used = 0;
+        let lastInput = 0, lastOutput = 0;
+        let estimated = false;
         const cached = sid ? sessionCache.get(sid) : undefined;
         if (cached) {
           active = (cached as any).isStreaming;
           model = (cached as any).model?.name || "-";
-          max = (cached as any).model?.contextWindow || 0;
-          for (const mm of cached.messages) {
-            if (mm.usage) used += (mm.usage.input || 0) + (mm.usage.cacheRead || 0);
+          const declaredWin = (cached as any).model?.contextWindow || 0;
+          if (declaredWin > 0) {
+            max = declaredWin;
+          } else {
+            max = FALLBACK_CONTEXT_WINDOW;
+            estimated = true;  // 标记窗口为兜底估算值
+          }
+          // 倒序找最后一条带 usage 的 assistant 消息
+          for (let i = cached.messages.length - 1; i >= 0; i--) {
+            const mm: any = cached.messages[i];
+            if (mm.role === "assistant" && mm.usage) {
+              lastInput = (mm.usage.input || 0) + (mm.usage.cacheRead || 0);
+              lastOutput = mm.usage.output || 0;
+              used = lastInput;
+              break;
+            }
           }
         }
         return json({
@@ -909,6 +936,11 @@ const server = Bun.serve({
             max_tokens: max,
             used_tokens: used,
             percent: max ? Math.min(100, Math.round((used / max) * 100)) : 0,
+            // 下一次请求 input 估算 = 当前窗口占用 + 末轮 output（不含待发的新用户消息）
+            next_input: used + lastOutput,
+            last_input: lastInput,
+            last_output: lastOutput,
+            estimated,  // true=窗口大小为兜底估算（model 未声明 contextWindow）
             duration: "-",
           },
         });
