@@ -346,6 +346,7 @@ async function runScheduledTask(taskId: string): Promise<ScheduleRun> {
     });
     session = result.session;
     sid = session.sessionId;
+    await initSessionExtensions(session, result.extensionsResult);
     if (session.sessionFile) idToPath.set(sid, session.sessionFile);
 
     // Timeout via abort
@@ -431,6 +432,26 @@ async function refreshIdToPath() {
   for (const s of all) idToPath.set(s.id, s.path);
 }
 
+/**
+ * 绑定扩展：触发 session_start 事件，让 otel-viewer 等扩展的事件处理器生效。
+ * 同时检查 extensionsResult.errors 和运行时 onError，补可观测性。
+ */
+async function initSessionExtensions(
+  session: AgentSession,
+  extensionsResult?: { errors?: unknown[] },
+) {
+  if (extensionsResult?.errors?.length) {
+    for (const e of extensionsResult.errors) {
+      console.error("[pi-bridge] extension load error:", e instanceof Error ? e.message : e);
+    }
+  }
+  await session.bindExtensions({
+    mode: "print",
+    onError: (err: unknown) =>
+      console.error("[pi-bridge] extension runtime error:", err instanceof Error ? err.message : err),
+  });
+}
+
 /** 按 sessionId 拿到（或从文件恢复）一个 AgentSession */
 async function ensureSession(sid: string): Promise<AgentSession> {
   const cached = sessionCache.get(sid);
@@ -439,13 +460,14 @@ async function ensureSession(sid: string): Promise<AgentSession> {
   const path = idToPath.get(sid);
   if (!path) throw new Error("session not found: " + sid);
   const sm = SessionManager.open(path);
-  const { session } = await createAgentSession({
+  const { session, extensionsResult } = await createAgentSession({
     sessionManager: sm,
     modelRuntime,
     cwd: CWD,
     model: defaultModel,
     ...(AGENT_DIR ? { agentDir: AGENT_DIR } : {}),
   });
+  await initSessionExtensions(session, extensionsResult);
   sessionCache.set(sid, session);
   evictSessionCache();
   return session;
@@ -710,13 +732,14 @@ const server = Bun.serve({
         const body = await readBody(req);
         const cwd = body.working_dir || CWD;
         const sm = SessionManager.create(cwd);
-        const { session } = await createAgentSession({
+        const { session, extensionsResult } = await createAgentSession({
           sessionManager: sm,
           modelRuntime,
           cwd,
           model: defaultModel,
           ...(AGENT_DIR ? { agentDir: AGENT_DIR } : {}),
         });
+        await initSessionExtensions(session, extensionsResult);
         const sid = session.sessionId;
         sessionCache.set(sid, session);
         evictSessionCache();
