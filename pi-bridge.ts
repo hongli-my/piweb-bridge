@@ -783,8 +783,15 @@ const server = Bun.serve({
           return json({ ok: true });
         }
 
-        // PATCH /sessions/:id — rename（暂桩，pi 用 set_session_name 但需 SessionManager）
-        if (!sub && m === "PATCH") return json({ ok: true });
+        // PATCH /sessions/:id — rename（setSessionName 内部调 sessionManager.appendSessionInfo 落盘）
+        if (!sub && m === "PATCH") {
+          const body = await readBody(req);
+          const newTitle = (body.title || "").toString().trim();
+          if (!newTitle) return json({ ok: false, error: "title required" }, 400);
+          const session = await ensureSession(sid);
+          session.setSessionName(newTitle);
+          return json({ ok: true, title: newTitle });
+        }
       }
 
       // ---- 对话流式 ----
