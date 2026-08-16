@@ -143,20 +143,35 @@ cd /Users/honglichang/openresty
 | 会话 | 线性 session id | 树形 fork/branch |
 | 项目 | 人工 project_id 关联 | 天然 = cwd 目录 |
 
+## 编译为单二进制（供 Tauri sidecar 打包）
+
+pi-bridge 可用 `bun build --compile` 编译为单可执行二进制，随 [slate](../slate) app 作为 sidecar 打包分发：
+
+```bash
+bun install
+bun build --compile --minify --sourcemap --target=bun-darwin-arm64 ./pi-bridge.ts --outfile pi-bridge
+```
+
+产物 ~71MB（含 Bun runtime + pi SDK）。跨平台替换 `--target`：
+
+| 平台 | target | 产物用途 |
+|------|--------|----------|
+| macOS ARM | `bun-darwin-arm64` | `pi-bridge-aarch64-apple-darwin` |
+| macOS Intel | `bun-darwin-x64` | `pi-bridge-x86_64-apple-darwin` |
+| Linux x64 | `bun-linux-x64` | `pi-bridge-x86_64-unknown-linux-gnu` |
+| Windows x64 | `bun-windows-x64` | `pi-bridge-x86_64-pc-windows-msvc.exe` |
+
+**注意事项**：
+- ⚠️ 不要加 `--bytecode`：与 pi-bridge.ts:38 的 top-level await 不兼容。
+- 编译后 `import.meta.dir` / `__dirname` 指向虚拟 `/$bunfs/root/`，**读运行时用户配置必须用 `os.homedir()`**（pi-bridge 已如此，无需改动）。
+- 环境变量正常可用（`process.env`），所有 PIWEB_* / OPENAI_* 由宿主 app spawn 时注入。
+- macOS 分发需配 JIT entitlements（见 slate README）。
+
 ## 调试
 
 ```bash
 # 看日志
 tail -f /tmp/pi-bridge.log
-
-# 最小 SDK 测试（排除 HTTP 层）
-bun run test-sdk.ts
-
-# E2E 浏览器测试（需 playwright，已装）
-bun run test-e2e.ts            # 基础对话
-bun run test-e2e-tools.ts      # 工具调用
-bun run test-projects.ts       # 项目/目录过滤
-bun run test-home.ts           # 首页 tab 完整链路
 ```
 
 常见问题：
@@ -172,9 +187,7 @@ bun run test-home.ts           # 首页 tab 完整链路
 ├── pi-bridge.ts        # 桥接服务（HTTP/SSE + SDK）
 ├── start.sh            # 启动脚本
 ├── package.json
-├── README.md           # 本文件
-├── test-sdk.ts         # SDK 最小测试
-└── test-e2e*.ts        # E2E 浏览器测试
+└── README.md           # 本文件
 
 nginx/html/piweb/       # 前端（copy 自 hermes，已清理冗余）
 nginx/conf/piweb.conf   # 静态 + API 反代

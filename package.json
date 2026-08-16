@@ -7,7 +7,6 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.1",
-    "croner": "^10.0.1",
-    "playwright": "^1.62.1"
+    "croner": "^10.0.1"
   }
 }

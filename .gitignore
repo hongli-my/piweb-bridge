@@ -11,3 +11,8 @@ node_modules/
 # 系统
 .DS_Store
 pi-bridge.pid
+
+# bun build --compile 产物
+pi-bridge
+pi-bridge.js.map
+pi-bridge-*/
