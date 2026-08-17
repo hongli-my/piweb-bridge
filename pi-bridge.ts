@@ -460,10 +460,14 @@ async function ensureSession(sid: string): Promise<AgentSession> {
   const path = idToPath.get(sid);
   if (!path) throw new Error("session not found: " + sid);
   const sm = SessionManager.open(path);
+  // 用 session 自身记录的 cwd，而非全局 CWD：恢复已有会话时必须保持原 cwd，
+  // 否则 agent 会在 sidecar 启动目录（通常 / 或 home）而非项目目录执行。
+  // 旧 session 无 cwd 时回退全局 CWD。
+  const cwd = sm.getCwd() || CWD;
   const { session, extensionsResult } = await createAgentSession({
     sessionManager: sm,
     modelRuntime,
-    cwd: CWD,
+    cwd,
     model: defaultModel,
     ...(AGENT_DIR ? { agentDir: AGENT_DIR } : {}),
   });
