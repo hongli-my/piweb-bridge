@@ -16,3 +16,6 @@ pi-bridge.pid
 pi-bridge
 pi-bridge.js.map
 pi-bridge-*/
+
+# build.sh 产物（编译 + 签名后的分发二进制）
+dist/

@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run pi-bridge.ts"
+    "start": "bun run pi-bridge.ts",
+    "build": "bash build.sh"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.1",
