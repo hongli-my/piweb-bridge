@@ -7,7 +7,7 @@
     "build": "bash build.sh"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
     "croner": "^10.0.1"
   }
 }

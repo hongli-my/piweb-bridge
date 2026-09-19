@@ -12,6 +12,53 @@ pi-bridge :8643  ──SDK 进程内──▶  pi AgentSession  ──▶  LLM (
 
 ---
 
+## 快速开始
+
+本仓库**可独立编译、独立运行**，不依赖 slate 或其他宿主。
+
+```bash
+cd ~/ai-home/piweb-bridge
+
+# 1. 安装依赖（首次）
+bun install
+```
+
+### 启动
+
+```bash
+# 前台运行（调试）
+./start.sh                    # 等价：bun run start / ./start.sh foreground
+
+# 后台常驻（带崩溃自重启守护）
+./start.sh start
+./start.sh status             # 进程 / 端口 / HTTP 探活
+./start.sh logs               # tail -f log/pi-bridge.log
+./start.sh stop
+
+# 探活
+curl -s http://127.0.0.1:8643/health
+# {"ok":true,"status":"up"}
+```
+
+> 启动前需配好模型认证（见下方[配置项](#配置项)）：至少 `OPENAI_API_KEY`，
+> 或先把 `~/.pi/agent/auth.json` 配好。无可用模型时进程会直接退出并提示。
+
+### 编译为独立单二进制
+
+```bash
+./build.sh                    # 等价：bun run build
+# → dist/pi-bridge-aarch64-apple-darwin（~71MB，含 Bun runtime + pi SDK，已 ad-hoc 签名）
+
+# 直接独立运行，不需要 bun / node_modules
+PIWEB_PORT=8643 ./dist/pi-bridge-aarch64-apple-darwin
+```
+
+`build.sh` 内部依次做：`bun install` → `bun build --compile --minify --sourcemap`
+→ 按 rust triple 重命名 → macOS ad-hoc 签名（JIT entitlements）。
+跨平台编译用 `PI_BRIDGE_TARGET` + `PI_BRIDGE_TRIPLE` 覆盖，产物表见[编译为单二进制](#编译为单二进制)。
+
+---
+
 ## 设计原则：**零翻译透传**
 
 pi-bridge 不做协议翻译。它**原样**暴露 pi SDK 的数据模型：
@@ -33,9 +80,9 @@ pi-bridge 不做协议翻译。它**原样**暴露 pi SDK 的数据模型：
 
 ---
 
-## 启动
+## 模型认证与启动细节
 
-### 1. 准备模型认证（与 pi CLI 一致）
+### 模型认证（与 pi CLI 一致）
 
 ```bash
 export PI_PROVIDER=my-openai-proxy
@@ -45,38 +92,39 @@ export OPENAI_BASE_URL=http://your-proxy/v1
 ```
 
 模型也可在 `~/.pi/agent/models.json` 里自定义 provider。pi-bridge 启动时只暴露
-**自定义 provider** 下的模型（过滤 SDK 内置项），用 `PI_PROVIDER` / `PI_MODEL` 指定默认。
+**自定义 provider** 下的模型（过滤 SDK 内置项），用 `PI_PROVIDER` / `PI_MODEL` 指定默认；
+都没配时依次回退 `anthropic` → `openai` → 列表首个，全无则退出并提示。
 
-### 2. 拉起服务
+### `start.sh` 行为
 
-**前台**（调试）：
-```bash
-cd ~/ai-home/piweb-bridge
-./start.sh              # 或 ./start.sh foreground
-bun run start           # 等价：bun run pi-bridge.ts
-```
+| 调用 | 行为 |
+|------|------|
+| `./start.sh` · `./start.sh foreground` | 前台运行，日志打到终端 |
+| `./start.sh start` | 后台守护循环：bun 退出后自动重启，指数退避 3s→60s（运行 >30s 视为健康并重置） |
+| `./start.sh stop` | 停守护进程并转发 TERM 给 bun 子进程；超时 10s 后 `kill -9` |
+| `./start.sh restart` | stop → 等 1s → start |
+| `./start.sh status` | PID / 端口监听 / `/health` 探活 三项检查 |
+| `./start.sh logs` | `tail -f log/pi-bridge.log` |
 
-**后台**（推荐，带崩溃自重启守护）：
-```bash
-./start.sh start
-```
+- 日志：`log/pi-bridge.log`；PID：`log/pi-bridge.pid`
+- 默认 `PIWEB_CWD` 为 `~/ai-home`（脚本上级目录）
+- 启动前会清除 `PI_SESSION_FILE` / `PI_SESSION_ID` / `PI_SUBAGENT_PARENT_SESSION` /
+  `PI_CODING_AGENT`，避免从 pi CLI 会话内启动时误继承环境导致 hang
 
-**管理命令**：
-```bash
-./start.sh stop      # 停止
-./start.sh restart   # 重启
-./start.sh status    # 状态（进程 / 端口 / HTTP 探活）
-./start.sh logs      # tail -f 日志
-```
+---
 
-日志 `log/pi-bridge.log`，PID 文件 `log/pi-bridge.pid`。
+## 依赖
 
-### 3. 探活
+| 依赖 | 版本 | 说明 |
+|------|------|------|
+| `@earendil-works/pi-coding-agent` | `^0.85.1` | pi AgentSession SDK，**编译时会整个打进二进制** |
+| `croner` | `^10.0.1` | `/schedules` 定时任务的 cron 调度 |
 
-```bash
-curl -s http://127.0.0.1:8643/health
-# {"ok":true,"status":"up"}
-```
+> ⚠️ **不要降到 0.84.x，也不要写 `^0.85.0`**：
+> - 0.84.x 与当前 pi CLI（0.85.1）共用同一份 `~/.pi/agent/`（sessions / settings / models），
+>   会产生版本错位；且缺 0.85 的几项关键修复：续接会话写坏 JSONL 尾记录（#8345）、
+>   工具忽略 `ctx.cwd`（#8627）、fork 丢失压缩边界（#8990）、分支摘要被 reasoning 输出上限打断（#8845）
+> - 0.85.0 存在发布事故（publish 了内部 experimental 代码导致 SDK import 失败），0.85.1 才修好
 
 ---
 
